@@ -153,6 +153,7 @@
   var nextTriggered = false;
   var navigating = false;
   var findTicks = 0;
+  var baselinePct = null;   // page progress read BEFORE this session contributed (previous progress)
 
   function goNextSoon(msg) {
     if (navigating) return;
@@ -328,17 +329,41 @@
 
   setInterval(function() {
     try {
-      if (nextTriggered || !video || video.paused) return;
+      if (nextTriggered || !video) return;
       var myPct = findMyProgress();
       if (myPct === null) {
         if (Math.random() < 0.2) log('looking for progress...');
         return;
       }
+
+      // First readable reading = the progress carried over from previous
+      // sessions (our own playback has barely started). If that is already
+      // >= 90%, this video is finished - skip it right away.
+      if (baselinePct === null) {
+        baselinePct = myPct;
+        if (myPct >= 90) {
+          log('already completed (' + myPct + '%) - skipping...');
+          nextTriggered = true;
+          goNextSoon('');
+          return;
+        }
+      }
+
+      if (video.paused) return;
       log('my progress: ' + myPct + '%');
       if (myPct >= 90) {
-        log('progress ' + myPct + '% >= 90% -> going next!');
-        nextTriggered = true;
-        goNextSoon('');
+        // The site's "我的播放进度" is 累计观看时长/视频总时长 - it can run ahead
+        // of the real playback position, so never jump unless the REAL
+        // position reached 90% too.
+        var dur = video.duration;
+        var realPct = (isFinite(dur) && dur > 0) ? (video.currentTime / dur) * 100 : 100;
+        if (realPct >= 90) {
+          log('progress ' + myPct + '% + actual ' + realPct.toFixed(1) + '% >= 90% -> going next!');
+          nextTriggered = true;
+          goNextSoon('');
+        } else {
+          log('server ' + myPct + '% but actual ' + realPct.toFixed(1) + '% - keep watching');
+        }
       }
     } catch(e) { log('err(prog): ' + e.message); }
   }, 3000);
