@@ -2,40 +2,58 @@
   'use strict';
 
   // ===== CONFIG =====
-  var SKIP_PDF_SEC = 4;          // PDF page: skip after this many seconds without a video
-  var SKIP_NONVIDEO_SEC = 12;    // any other non-video page: fallback skip timeout
-  var NEXT_WAIT_TRIES = 30;      // goNext: retries while the course sidebar is still loading
+  var SKIP_NONVIDEO_SEC = 12;    // non-video page: skip after this many seconds without a video
+  var NEXT_WAIT_TRIES = 60;      // max seconds to wait for the course sidebar to load
   var STALL_RECOVER_MS = 10000;  // no playback progress for this long -> try recovery
   var STALL_RELOAD_MS = 25000;   // still no progress -> reload page to recover
   var MAX_RELOADS = 3;           // anti-loop guard for emergency reloads
 
-  // ===== GLOBAL ERROR SURFACE (visible in status bar) =====
-  window.onerror = function(msg, src, line) {
-    try { log('err: ' + msg + ' @' + line); } catch(e) {}
-    return false;
-  };
-
   // ===== HELPERS =====
-  // Extract numeric resource id from "...view.php?id=123" style URLs
   function resId(url) {
     var m = String(url || '').match(/[?&]id=(\d+)/);
     return m ? m[1] : null;
   }
-
   function visible(el) { return el && el.offsetWidth > 0 && el.offsetHeight > 0; }
+  function absUrl(h) {
+    return h.indexOf('http') === 0 ? h :
+      location.origin + (h.charAt(0) === '/' ? '' : '/') + h;
+  }
+  // Find the sidebar link that follows the current resource.
+  // Returns: null = list not loaded yet, '' = no next item, url = next resource.
+  function findNextUrl() {
+    var links = document.querySelectorAll('a[href*="fsresource"]');
+    var curId = resId(location.href);
+    for (var i = 0; i < links.length; i++) {
+      var h = links[i].getAttribute('href') || '';
+      if (!h) continue;
+      if (resId(h) === curId) {
+        for (var j = i + 1; j < links.length; j++) {
+          var h2 = links[j].getAttribute('href') || '';
+          if (h2 && resId(h2) !== curId) return absUrl(h2);
+        }
+        return ''; // current item is the last one
+      }
+    }
+    return null;
+  }
 
-  // ===== ONLY FULL MODE ON RESOURCE PAGES =====
+  // ===== PAGE TYPE =====
   var isFsResource = location.href.indexOf('fsresource') >= 0;
+  // Reliable, zero-cost PDF detection: tab title like "4.1 xxx.pdf | 蕴瑜课堂"
+  var isPdf = isFsResource && /\.pdf\b/i.test(document.title || '');
+
+  // ===== KILL SWITCH (click the YYKT logo to toggle) =====
+  var disabled = false;
+  try { disabled = localStorage.__yykt_disabled === '1'; } catch(e) {}
 
   // ===== LAST VIDEO RESUME =====
-  // NOTE: __yykt_last_video is saved inside setup() (only when a real video
-  // was found), so PDF pages no longer poison the resume target.
-
+  // __yykt_last_video is saved in setup() only after a real video is found,
+  // so PDF pages never poison the resume target.
   var isHomePage = location.pathname === '/' || location.pathname === '' ||
                    location.href === 'https://courses.gdut.edu.cn/' ||
                    location.pathname.indexOf('/my') >= 0 ||
                    location.pathname.indexOf('/dashboard') >= 0;
-  if (isHomePage) {
+  if (isHomePage && !disabled) {
     var redirected = false;
     try { redirected = sessionStorage.__yykt_redirected === '1'; } catch(e) {}
     if (!redirected) {
@@ -54,108 +72,143 @@
 
   if (!isFsResource) return;
 
-  // ===== BELOW THIS LINE: RESOURCE PAGE ONLY =====
-
-  // State bar
+  // ===== STATE BAR (static; logo click toggles the kill switch) =====
   var bar = document.createElement('div');
   bar.id = 'yykt_bar';
   bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;' +
     'background:#0d1117;color:#eee;font-size:12px;padding:6px 14px;' +
     'font-family:sans-serif;display:flex;align-items:center;gap:10px;';
-  bar.innerHTML = '<b style="color:#58a6ff;">YYKT</b> <span id="y_msg">init</span>' +
-    '<span style="flex:1;"></span><span id="y_time"></span>';
+  bar.innerHTML = '<b id="y_logo" style="color:#58a6ff;cursor:pointer;user-select:none;">YYKT</b>' +
+    '<span id="y_msg">init</span><span style="flex:1;"></span><span id="y_time"></span>';
   document.body.prepend(bar);
 
-  // Log only on message change: repeated identical writes feed the
-  // MutationObserver and can livelock the page.
   var lastMsg = '';
   function log(s) {
-    if (s === lastMsg) return;
+    if (s === lastMsg) return; // dedupe: repeated identical DOM writes are waste
     lastMsg = s;
     var e = document.getElementById('y_msg');
     if (e) e.textContent = s;
   }
+  window.onerror = function(msg, src, line) {
+    try { log('err: ' + msg + ' @' + line); } catch(e) {}
+    return false;
+  };
   function timeStr(t) {
     var m = Math.floor(t / 60), s = Math.floor(t % 60);
     return m + ':' + String(s).padStart(2, '0');
   }
 
-  // ===== STATE =====
+  document.getElementById('y_logo').addEventListener('click', function() {
+    try {
+      if (disabled) {
+        delete localStorage.__yykt_disabled;
+        log('enabled - reloading...');
+      } else {
+        localStorage.__yykt_disabled = '1';
+        disabled = true;
+        log('DISABLED - click YYKT again to re-enable');
+        return;
+      }
+    } catch(e) {}
+    setTimeout(function() { location.reload(); }, 600);
+  });
+
+  if (disabled) { log('OFF - click YYKT to enable'); return; }
+
+  // ===== PDF FAST PATH: MINIMAL SKIP MODE =====
+  // No MutationObserver, no verification scanning, no watchdog, no dialog
+  // clicking. Just one lightweight 1s interval that waits for the course
+  // sidebar and jumps to the next resource. Minimal footprint = nothing for
+  // the site's own PDF scripts to collide with.
+  if (isPdf) {
+    log('pdf detected - minimal skip mode');
+    var pdfTries = 0;
+    var pdfTimer = setInterval(function() {
+      try {
+        pdfTries++;
+        var next = findNextUrl();
+        if (next) {
+          clearInterval(pdfTimer);
+          log('pdf - jumping to next resource...');
+          setTimeout(function() { location.href = next; }, 500);
+          return;
+        }
+        if (next === '') { clearInterval(pdfTimer); log('pdf - all resources done'); return; }
+        if (pdfTries >= NEXT_WAIT_TRIES) {
+          clearInterval(pdfTimer);
+          log('pdf - resource list never loaded');
+          return;
+        }
+        log('pdf - waiting for list (' + pdfTries + '/' + NEXT_WAIT_TRIES + ')');
+      } catch(e) { log('err(pdf): ' + e.message); }
+    }, 1000);
+    return; // PDF page ends here - nothing else runs
+  }
+
+  // ===== BELOW THIS LINE: FULL MODE (video pages / unknown resource pages) =====
+
   var video = null;
   var holding = false;
   var holdTimer = null;
   var nextTriggered = false;
   var navigating = false;
-  var findTicks = 0;   // seconds elapsed since we started looking for a video
+  var findTicks = 0;
 
-  // ===== PDF / NON-VIDEO DETECTION =====
-  // Signals (checked in order):
-  //  1. page title ends with .pdf   (most reliable: tab shows "xxx.pdf | ...")
-  //  2. sidebar link title of the current resource ends with .pdf
-  //  3. an embedded PDF viewer exists on the page
-  function isPdfPage() {
-    try {
-      if (/\.pdf\b/i.test(document.title || '')) return true;
-      var curId = resId(location.href);
-      if (curId) {
-        var links = document.querySelectorAll('a[href*="fsresource"]');
-        for (var i = 0; i < links.length; i++) {
-          var h = links[i].getAttribute('href') || '';
-          if (resId(h) === curId) {
-            if (/\.pdf\b/i.test(links[i].textContent || '')) return true;
-          }
-        }
-      }
-      if (document.querySelector('embed[type*="pdf"], object[data*=".pdf"], iframe[src*=".pdf"]')) return true;
-    } catch(e) { log('err(pdf): ' + e.message); }
-    return false;
+  function goNextSoon(msg) {
+    if (navigating) return;
+    navigating = true;
+    if (msg) log(msg);
+    setTimeout(goNext, 800);
   }
 
-  // ===== FIND VIDEO (interval-driven, no retry chains, no observer recursion) =====
-  function findVideoElement() {
-    var v = document.querySelector('video');
-    if (v && v.offsetWidth > 0) return v;
-    var ifs = document.querySelectorAll('iframe');
-    for (var i = 0; i < ifs.length; i++) {
-      try {
-        var d = ifs[i].contentDocument || ifs[i].contentWindow.document;
-        v = d && d.querySelector('video');
-        if (v && v.offsetWidth > 0) return v;
-      } catch(e) {}
-    }
-    return null;
-  }
-
-  function findVideoTick() {
+  var goNextTries = 0;
+  function goNext() {
     try {
-      if (video || navigating) return;
-      var v = findVideoElement();
-      if (v) { setup(v); return; }
-
-      findTicks++;
-      var isPdf = isPdfPage();
-      var limit = isPdf ? SKIP_PDF_SEC : SKIP_NONVIDEO_SEC;
-      if (findTicks >= limit) {
-        // Non-video resource (PDF etc.): skip it and keep walking until a video page.
-        nextTriggered = true;
-        goNextSoon(isPdf ? 'pdf detected - skipping...' : 'no video here - skipping...');
-      } else if (findTicks % 3 === 0) {
-        log(isPdf ? 'pdf detected, skip in ' + (limit - findTicks) + 's...'
-                  : 'looking for video...');
+      var next = findNextUrl();
+      if (next) {
+        log('next resource...');
+        location.href = next;
+        return;
       }
-    } catch(e) {
-      log('err(find): ' + e.message);
-    }
+      if (next === '') { log('all done!'); return; }
+      // Sidebar not loaded yet: retry for a while
+      goNextTries++;
+      if (goNextTries <= NEXT_WAIT_TRIES) {
+        log('waiting for resource list... (' + goNextTries + '/' + NEXT_WAIT_TRIES + ')');
+        setTimeout(goNext, 2000);
+        return;
+      }
+      log('all done!');
+    } catch(e) { log('err(next): ' + e.message); }
   }
 
   function setup(v) {
     video = v;
     log('video found');
 
-    // Remember this page as the resume target ONLY when a video is confirmed
     try { localStorage.__yykt_last_video = location.href; } catch(e) {}
 
-    // Prevent browser from suspending video when minimized
+    // Silent-audio keepalive: an (inaudible, gain=0.001) oscillator makes
+    // Chrome treat this tab as "playing audio", so background timer
+    // throttling never kicks in. The site's progress heartbeat keeps firing
+    // and the "网络异常" alert stops appearing at the source.
+    try {
+      if (!window.__yyktKeepAlive) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) {
+          var ctx = new AC();
+          var osc = ctx.createOscillator();
+          var gain = ctx.createGain();
+          gain.gain.value = 0.001;
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start();
+          if (ctx.state === 'suspended' && ctx.resume) ctx.resume();
+          window.__yyktKeepAlive = true;
+        }
+      }
+    } catch(e) {}
+
     v.setAttribute('playsinline', '');
     v.setAttribute('webkit-playsinline', '');
     if ('mediaSession' in navigator) {
@@ -176,7 +229,6 @@
     v.addEventListener('pause', function() {
       log('paused');
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-      // Auto-resume if unexpectedly paused (browser throttling)
       if (!nextTriggered && v.currentTime < v.duration - 2) {
         setTimeout(function() { v.play().catch(function(){}); }, 200);
       }
@@ -184,8 +236,6 @@
     v.addEventListener('ended', function() {
       if (!nextTriggered) { log('ended - next...'); nextTriggered = true; goNextSoon(''); }
     });
-    // Media stream network error: reload the source automatically.
-    // If the source is dead, the stall watchdog will reload the page as fallback.
     v.addEventListener('error', function() {
       log('media error - retrying source...');
       setTimeout(function() {
@@ -204,7 +254,39 @@
     });
   }
 
-  // ===== FIND "MY PLAYBACK PROGRESS" ON PAGE =====
+  function findVideoElement() {
+    var v = document.querySelector('video');
+    if (v && v.offsetWidth > 0) return v;
+    var ifs = document.querySelectorAll('iframe');
+    for (var i = 0; i < ifs.length; i++) {
+      try {
+        var d = ifs[i].contentDocument || ifs[i].contentWindow.document;
+        v = d && d.querySelector('video');
+        if (v && v.offsetWidth > 0) return v;
+      } catch(e) {}
+    }
+    return null;
+  }
+
+  // Single driver loop for finding the video / deciding to skip
+  var findTimer = setInterval(function() {
+    try {
+      if (video || navigating) return;
+      var v = findVideoElement();
+      if (v) { clearInterval(findTimer); setup(v); return; }
+
+      findTicks++;
+      if (findTicks >= SKIP_NONVIDEO_SEC) {
+        clearInterval(findTimer);
+        nextTriggered = true;
+        goNextSoon('no video here - skipping...');
+      } else if (findTicks % 3 === 0) {
+        log('looking for video...');
+      }
+    } catch(e) { log('err(find): ' + e.message); }
+  }, 1000);
+
+  // ===== "MY PLAYBACK PROGRESS" =====
   function findMyProgress() {
     var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
     var node;
@@ -244,101 +326,55 @@
     return null;
   }
 
-  // ===== CHECK MY PROGRESS -> GO NEXT =====
-  function checkProgress() {
-    if (nextTriggered) return;
-    if (!video || video.paused) return;
-
-    var myPct = findMyProgress();
-    if (myPct === null) {
-      if (Math.random() < 0.2) log('looking for progress...');
-      return;
-    }
-
-    log('my progress: ' + myPct + '%');
-
-    if (myPct >= 90) {
-      log('progress ' + myPct + '% >= 90% -> going next!');
-      nextTriggered = true;
-      goNextSoon('');
-    }
-  }
-
-  // ===== NEXT =====
-  // Strict matching by resource id: "id=17828" no longer matches "id=178282".
-  // The course sidebar loads asynchronously (empty skeleton on first seconds),
-  // so retry while no usable link list exists instead of giving up.
-  var goNextTries = 0;
-  function goNext() {
+  setInterval(function() {
     try {
-      var links = document.querySelectorAll('a[href*="fsresource"]');
-      var curId = resId(location.href);
-      var found = false;
-      for (var i = 0; i < links.length; i++) {
-        var h = links[i].getAttribute('href') || '';
-        if (!h) continue;
-        var id = resId(h);
-        if (id && id === curId) { found = true; continue; }
-        if (found) {
-          var url = h.startsWith('http') ? h :
-            location.origin + (h.startsWith('/') ? '' : '/') + h;
-          log('next: ' + (links[i].textContent || '').substring(0, 30));
-          location.href = url;
-          return;
-        }
-      }
-      // Sidebar not loaded yet (or current item missing): keep waiting a while
-      if (goNextTries++ < NEXT_WAIT_TRIES) {
-        log('waiting for resource list... (' + goNextTries + '/' + NEXT_WAIT_TRIES + ')');
-        setTimeout(goNext, 2000);
+      if (nextTriggered || !video || video.paused) return;
+      var myPct = findMyProgress();
+      if (myPct === null) {
+        if (Math.random() < 0.2) log('looking for progress...');
         return;
       }
-      log('all done!');
-    } catch(e) {
-      log('err(next): ' + e.message);
-    }
-  }
+      log('my progress: ' + myPct + '%');
+      if (myPct >= 90) {
+        log('progress ' + myPct + '% >= 90% -> going next!');
+        nextTriggered = true;
+        goNextSoon('');
+      }
+    } catch(e) { log('err(prog): ' + e.message); }
+  }, 3000);
 
-  function goNextSoon(msg) {
-    if (navigating) return;
-    navigating = true;
-    if (msg) log(msg);
-    setTimeout(goNext, 800);
-  }
-
-  // ===== DIALOG AUTO-CLICK (network error / confirm popups) =====
+  // ===== DIALOG AUTO-CLICK =====
   var DIALOG_BTN_TEXT = /^(继续|继续播放|重新播放|重试|确定|恢复播放|播放)$/;
 
   function clickDialogButtons() {
-    try {
-      var sels = '.ui-dialog button, .ui-dialog-buttonpane button, .layui-layer-btn a, ' +
-        '.modal button, .modal .btn, [class*="dialog"] button, [class*="dialog"] a.btn, ' +
-        '[class*="modal"] button, [class*="modal"] .btn, [class*="popup"] button, ' +
-        'button, a.btn, .btn';
-      var els = document.querySelectorAll(sels);
-      var now = Date.now();
-      for (var i = 0; i < els.length; i++) {
-        var el = els[i];
-        if (!visible(el)) continue;
-        var txt = (el.textContent || '').trim();
-        if (!txt || !DIALOG_BTN_TEXT.test(txt)) continue;
-        if (el.offsetHeight > 60 || el.offsetWidth > 400) continue;
-        var last = parseInt(el.dataset._ylast || '0', 10);
-        if (now - last < 5000) continue;
-        el.dataset._ylast = String(now);
-        log('auto-click dialog: ' + txt);
-        try { el.click(); } catch(e) {}
-      }
-    } catch(e) { log('err(dlg): ' + e.message); }
+    var sels = '.ui-dialog button, .ui-dialog-buttonpane button, .layui-layer-btn a, ' +
+      '.modal button, .modal .btn, [class*="dialog"] button, [class*="dialog"] a.btn, ' +
+      '[class*="modal"] button, [class*="modal"] .btn, [class*="popup"] button, ' +
+      'button, a.btn, .btn';
+    var els = document.querySelectorAll(sels);
+    var now = Date.now();
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (!visible(el)) continue;
+      var txt = (el.textContent || '').trim();
+      if (!txt || !DIALOG_BTN_TEXT.test(txt)) continue;
+      if (el.offsetHeight > 60 || el.offsetWidth > 400) continue;
+      var last = parseInt(el.dataset._ylast || '0', 10);
+      if (now - last < 5000) continue;
+      el.dataset._ylast = String(now);
+      log('auto-click dialog: ' + txt);
+      try { el.click(); } catch(e) {}
+    }
   }
+  setInterval(function() { if (video) clickDialogButtons(); }, 2000);
 
-  // ===== STALL WATCHDOG (auto-recovery without human action) =====
+  // ===== STALL WATCHDOG =====
   var lastPos = -1;
   var lastMoveTs = Date.now();
   var reloads = 0;
   try { reloads = parseInt(sessionStorage.__yykt_reloads || '0', 10) || 0; } catch(e) {}
 
-  function watchdog() {
+  setInterval(function() {
     try {
       if (!video || nextTriggered || holding) { lastMoveTs = Date.now(); return; }
       if (video.ended) return;
@@ -370,11 +406,16 @@
         }
       }
     } catch(e) { log('err(wd): ' + e.message); }
-  }
+  }, 3000);
 
-  // ===== VERIFICATION HOLD =====
+  // ===== VERIFICATION HOLD (throttled scan) =====
+  var lastHoldScan = 0;
   function scanHold() {
     if (holding) return;
+    var now = Date.now();
+    if (now - lastHoldScan < 2000) return; // throttle: at most one scan per 2s
+    lastHoldScan = now;
+
     var els = document.querySelectorAll('button, [role="button"], div[class*="btn"], div[class*="hold"], div[class*="verify"], span[class*="btn"], span[class*="hold"]');
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
@@ -435,27 +476,11 @@
     }, 200);
   }
 
-  // ===== START =====
-  log('activating...');
+  setInterval(scanHold, 2000);
 
-  // Single driver loop: no retry chains, observer never re-enters findVideo
-  setInterval(findVideoTick, 1000);
-
-  setInterval(function() {
-    if (video && !nextTriggered) checkProgress();
-  }, 3000);
-
-  setInterval(scanHold, 3000);
-
-  setInterval(clickDialogButtons, 2000);
-
-  setInterval(watchdog, 3000);
-
-  // Observer only handles the hold-verification; findVideo is driven by the
-  // interval above, so logging can never feed back into an infinite loop.
-  var observer = new MutationObserver(function() {
-    scanHold();
-  });
+  // Observer is only a backup trigger for scanHold, hard-throttled, and it
+  // never re-enters findVideo and never writes DOM.
+  var observer = new MutationObserver(function() { scanHold(); });
   observer.observe(document.body, { childList: true, subtree: true });
 
 })();
