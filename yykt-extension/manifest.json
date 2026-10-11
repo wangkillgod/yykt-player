@@ -1,8 +1,13 @@
 {
   "manifest_version": 3,
   "name": "YYKT Auto Player",
-  "version": "1.6",
-  "description": "Auto play videos on courses.gdut.edu.cn (auto-skip PDF, suppress network-error alerts, auto-recover)",
+  "version": "1.24",
+  "description": "Auto play videos on courses.gdut.edu.cn (cross-course auto-play, course-home completion scan, auto-skip PDF, auto-recover)",
+  "permissions": ["storage", "scripting", "activeTab"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "YYKT Auto Player 设置"
+  },
   "content_scripts": [
     {
       "matches": ["https://courses.gdut.edu.cn/*"],
