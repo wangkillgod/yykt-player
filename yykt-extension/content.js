@@ -716,7 +716,8 @@
   var navigating = false;
   var findTicks = 0;
   var baselinePct = null;
-  var endReplayCount = 0;  // how many times we've replayed the tail to force heartbeat
+  var endReplayCount = 0;  // how many times we've replayed to force progress
+  var rewatchMode = false; // true when we've rewound and are re-watching to accumulate progress
 
   function goNextSoon(msg) {
     if (navigating) return;
@@ -809,10 +810,9 @@
       nextTriggered = true;
       log('video ended - waiting for server progress sync...');
 
-      // After the video ends, the site's progress heartbeat may not have
-      // reported the final chunk yet.  Poll the displayed progress for up
-      // to ~15s; once it reaches 90% we can safely advance.  If it never
-      // reaches 90%, replay the last 5 seconds to force a final heartbeat.
+      // After the video ends, wait a few seconds for the final heartbeat,
+      // then check server progress.  If below 90%, rewind and re-watch
+      // a portion of the video to accumulate more watch time on the server.
       var endChecks = 0;
       var endTimer = setInterval(function() {
         try {
@@ -821,7 +821,7 @@
           var dur = v.duration;
           var realPct = (isFinite(dur) && dur > 0) ? (v.currentTime / dur) * 100 : 100;
           log('ended wait: server=' + (pct !== null ? pct + '%' : '?') +
-              ' actual=' + realPct.toFixed(1) + '% (' + endChecks + '/6)');
+              ' actual=' + realPct.toFixed(1) + '% (' + endChecks + '/3)');
 
           if (pct !== null && pct >= 90) {
             clearInterval(endTimer);
@@ -830,26 +830,45 @@
             return;
           }
 
-          if (endChecks >= 6) {
+          if (endChecks >= 3) {
             clearInterval(endTimer);
-            // Server progress still below 90% after 18s — replay tail once
-            if (endReplayCount < 1 && pct !== null && pct < 90 && isFinite(dur) && dur > 5) {
+            // Server progress still below 90% after 9s — rewind and re-watch
+            var MAX_REPLAYS = 3;
+            if (endReplayCount < MAX_REPLAYS && pct !== null && pct < 90 && isFinite(dur) && dur > 10) {
               endReplayCount++;
-              log('WARNING: server only ' + pct + '% after ended - replaying last 6s to force heartbeat (attempt ' + endReplayCount + ')');
+              // Calculate rewind position based on how far below 90% we are.
+              // The bigger the gap, the further back we rewind to accumulate
+              // enough watch time for the server to register progress.
+              var gap = 90 - pct;
+              var rewindRatio;
+              if (gap > 15) {
+                rewindRatio = 0.25;  // <75%: rewind to 25% (watch 75% of video)
+              } else if (gap > 10) {
+                rewindRatio = 0.40;  // 75-80%: rewind to 40%
+              } else if (gap > 5) {
+                rewindRatio = 0.55;  // 80-85%: rewind to 55%
+              } else {
+                rewindRatio = 0.70;  // 85-89%: rewind to 70%
+              }
+              var targetTime = Math.max(0, dur * rewindRatio);
+              rewatchMode = true;
+              log('WARNING: server only ' + pct + '% (gap ' + gap.toFixed(1) + '%) - rewinding to ' +
+                  targetTime.toFixed(0) + 's (' + (rewindRatio*100).toFixed(0) + '%) to accumulate progress ' +
+                  '(attempt ' + endReplayCount + '/' + MAX_REPLAYS + ')');
               try {
-                v.currentTime = Math.max(0, dur - 6);
+                v.currentTime = targetTime;
                 nextTriggered = false; // re-arm so normal flow handles the re-play
                 var rp = v.play();
                 if (rp && rp.catch) rp.catch(function() {});
               } catch(e) {
-                log('replay failed, advancing anyway');
+                log('rewind failed, advancing anyway');
                 goNextSoon('');
               }
             } else {
-              if (endReplayCount >= 1) {
-                log('server still below 90% after replay - advancing anyway (cannot force more)');
+              if (endReplayCount >= MAX_REPLAYS) {
+                log('server still below 90% after ' + MAX_REPLAYS + ' rewatch attempts - advancing anyway');
               } else {
-                log('progress unreadable, advancing anyway');
+                log('progress unreadable or video too short, advancing anyway');
               }
               goNextSoon('');
             }
@@ -973,6 +992,18 @@
       }
 
       if (video.paused) return;
+
+      // In rewatch mode (we rewound because server progress was below 90%),
+      // jump to next video as soon as server progress reaches 90% — no need
+      // to wait for the video to end again.
+      if (rewatchMode && myPct >= 90) {
+        log('rewatch: server progress reached ' + myPct + '% -> going next');
+        rewatchMode = false;
+        nextTriggered = true;
+        goNextSoon('');
+        return;
+      }
+
       // v1.9: no longer jump at 90%.  We wait for the video to fully end
       // (see 'ended' handler), then confirm server progress before advancing.
       // This avoids cutting off videos and gives the server time to log

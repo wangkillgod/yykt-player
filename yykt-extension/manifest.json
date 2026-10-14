@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YYKT Auto Player",
-  "version": "1.24",
+  "version": "1.25",
   "description": "Auto play videos on courses.gdut.edu.cn (cross-course auto-play, course-home completion scan, auto-skip PDF, auto-recover)",
   "permissions": ["storage", "scripting", "activeTab"],
   "action": {
